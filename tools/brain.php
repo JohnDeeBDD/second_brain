@@ -67,7 +67,7 @@ function main(array $argv): void {
             $db->exec("DELETE FROM refs;");
             $db->exec("DELETE FROM blocks;");
             if (hasFts($db)) {
-                @$db->exec("INSERT INTO blocks_fts(blocks_fts) VALUES('delete-all')");
+                @$db->exec("DELETE FROM blocks_fts");
             }
 
             $files = gatherMarkdownFiles($vaultDir);
@@ -280,15 +280,7 @@ function stampFile(string $file): array {
         }
     }
 
-    foreach ($lines as $i => $line) {
-        $trim = trim($line);
-        if ($trim === '') continue;
-
-        // Skip code fences and their contents (simple state machine)
-        // We'll do a quick second pass with a state flag:
-    }
-
-    // Better: iterate with fenced-code tracking
+    // Iterate with fenced-code tracking
     $inFence = false;
     foreach ($lines as $i => $line) {
         $trim = trim($line);
@@ -373,11 +365,7 @@ function initDb(string $dbPath): void {
     ");
 
     // FTS5 table (if available)
-    // If FTS5 is missing, this statement may fail; we handle it by trying and ignoring.
-    @$db->exec("
-        CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts
-        USING fts5(id, content, file_path, content='');
-    ");
+    ensureFtsTable($db);
 
     $db->exec("
         CREATE TABLE IF NOT EXISTS refs (
@@ -389,12 +377,32 @@ function initDb(string $dbPath): void {
     $db->close();
 }
 
+function ensureFtsTable(SQLite3 $db): void {
+    $sql = (string) @$db->querySingle("SELECT sql FROM sqlite_master WHERE type='table' AND name='blocks_fts'");
+    $needsCreate = $sql === '';
+    $isContentless = $sql !== '' && str_contains(strtolower($sql), "content=''");
+
+    if ($isContentless) {
+        @$db->exec("DROP TABLE IF EXISTS blocks_fts");
+        $needsCreate = true;
+    }
+
+    if ($needsCreate) {
+        // If FTS5 is missing, this statement may fail; we handle it by trying and ignoring.
+        @$db->exec("
+            CREATE VIRTUAL TABLE blocks_fts
+            USING fts5(id, content, file_path);
+        ");
+    }
+}
+
 function openDb(string $dbPath): SQLite3 {
     if (!class_exists('SQLite3')) fail("PHP SQLite3 extension not available.");
     $db = new SQLite3($dbPath);
     $db->exec("PRAGMA journal_mode=WAL;");
     $db->exec("PRAGMA synchronous=NORMAL;");
     ensureBlockColumns($db);
+    ensureFtsTable($db);
     return $db;
 }
 
@@ -467,10 +475,6 @@ function parseBlocksFromFile(string $file): array {
         }
 
         $headingPath = headingPathForLine($headingStack, $lineNo);
-
-        if ($headingPath !== '' && $blockType !== 'heading') {
-            $content = $headingPath . ' :: ' . $content;
-        }
 
         $blocks[] = [
             'id' => $id,
@@ -713,7 +717,7 @@ function suggestLinks(SQLite3 $db, string $sourceBlockId, int $limit, float $min
     $df = [];
     foreach ($all as $b) {
         $id = (string) $b['id'];
-        $tokens = tokenize((string) $b['content']);
+        $tokens = tokenizeForBlock($b);
         $docTerms[$id] = $tokens;
         $unique = array_keys($tokens);
         foreach ($unique as $t) {
@@ -773,6 +777,13 @@ function suggestLinks(SQLite3 $db, string $sourceBlockId, int $limit, float $min
     });
 
     return array_slice($scores, 0, max(1, min($limit, 100)));
+}
+
+function tokenizeForBlock(array $block): array {
+    $content = (string) ($block['content'] ?? '');
+    $headingPath = (string) ($block['heading_path'] ?? '');
+    $joined = trim($headingPath . ' ' . $content);
+    return tokenize($joined);
 }
 
 function tokenize(string $text): array {
